@@ -22,7 +22,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/Host.h"
 #include "llvm/Support/MathExtras.h"
-#include "llvm/Support/TargetRegistry.h"
+#include "llvm/MC/TargetRegistry.h"
 
 #include "TopologicalSorter.h"
 
@@ -83,7 +83,11 @@ bool IsPowerOfTwo(unsigned long x)
 
 unsigned int NumberOfElements(VectorType *TheType) {
 #if LLVM_VERSION_MAJOR >= 12
-  return TheType->getElementCount().getValue();
+  ElementCount EC = TheType->getElementCount();
+  if(EC.isScalable())
+    return EC.getKnownMinValue();
+  else
+    return EC.getFixedValue();
 #else
   return TheType->getNumElements();
 #endif
@@ -634,7 +638,7 @@ raw_ostream &CWriter::printStructDeclaration(raw_ostream &Out,
 raw_ostream &CWriter::printFunctionAttributes(raw_ostream &Out,
                                               AttributeList Attrs) {
   SmallVector<std::string, 5> AttrsToPrint;
-  for (const auto &FnAttr : Attrs.getFnAttributes()) {
+  for (const auto &FnAttr : Attrs.getFnAttrs()) {
     if (FnAttr.isEnumAttribute() || FnAttr.isIntAttribute()) {
       switch (FnAttr.getKindAsEnum()) {
       case Attribute::AttrKind::AlwaysInline:
@@ -771,7 +775,7 @@ CWriter::printFunctionProto(raw_ostream &Out, FunctionType *FTy,
 
   AttributeList &PAL = Attrs.first;
 
-  if (PAL.hasAttribute(AttributeList::FunctionIndex, Attribute::NoReturn)) {
+  if (PAL.hasAttributeAtIndex(AttributeList::FunctionIndex, Attribute::NoReturn)) {
     headerUseNoReturn();
     Out << "__noreturn ";
   }
@@ -781,20 +785,20 @@ CWriter::printFunctionProto(raw_ostream &Out, FunctionType *FTy,
     Out << MainArgs.begin()[0].first;
   } else {
     // Should this function actually return a struct by-value?
-    isStructReturn = PAL.hasAttribute(1, Attribute::StructRet) ||
-                     PAL.hasAttribute(2, Attribute::StructRet);
+    isStructReturn = PAL.hasAttributeAtIndex(1, Attribute::StructRet) ||
+                     PAL.hasAttributeAtIndex(2, Attribute::StructRet);
     // Get the return type for the function.
     Type *RetTy;
     if (!isStructReturn)
       RetTy = FTy->getReturnType();
     else {
       // If this is a struct-return function, print the struct-return type.
-      RetTy = cast<PointerType>(FTy->getParamType(0))->getElementType();
+      RetTy = cast<PointerType>(FTy->getParamType(0))->getPointerElementType();
     }
     printTypeName(
         Out, RetTy,
         /*isSigned=*/
-        PAL.hasAttribute(AttributeList::ReturnIndex, Attribute::SExt));
+        PAL.hasAttributeAtIndex(AttributeList::ReturnIndex, Attribute::SExt));
   }
 
   switch (Attrs.second) {
@@ -842,10 +846,10 @@ CWriter::printFunctionProto(raw_ostream &Out, FunctionType *FTy,
     if (ArgTy->isMetadataTy())
       continue;
 
-    if (PAL.hasAttribute(Idx, Attribute::ByVal)) {
+    if (PAL.hasAttributeAtIndex(Idx, Attribute::ByVal)) {
       cwriter_assert(!shouldFixMain);
       cwriter_assert(ArgTy->isPointerTy());
-      ArgTy = cast<PointerType>(ArgTy)->getElementType();
+      ArgTy = cast<PointerType>(ArgTy)->getPointerElementType();
     }
     if (PrintedArg)
       Out << ", ";
@@ -854,7 +858,7 @@ CWriter::printFunctionProto(raw_ostream &Out, FunctionType *FTy,
     else
       printTypeNameUnaligned(
           Out, ArgTy,
-          /*isSigned=*/PAL.hasAttribute(Idx, Attribute::SExt));
+          /*isSigned=*/PAL.hasAttributeAtIndex(Idx, Attribute::SExt));
     PrintedArg = true;
     if (ArgList) {
       Out << ' ';
@@ -2469,7 +2473,7 @@ void CWriter::generateHeader(Module &M) {
     // Ignore special globals, such as debug info.
     if (getGlobalVariableClass(&*I))
       continue;
-    printTypeName(NullOut, I->getType()->getElementType(), false);
+    printTypeName(NullOut, I->getType()->getPointerElementType(), false);
   }
   printModuleTypes(Out);
 
@@ -2499,7 +2503,7 @@ void CWriter::generateHeader(Module &M) {
       if (I->isThreadLocal())
         Out << "__thread ";
 
-      Type *ElTy = I->getType()->getElementType();
+      Type *ElTy = I->getType()->getPointerElementType();
       unsigned Alignment = I->getAlignment();
       bool IsOveraligned =
           Alignment && Alignment > TD->getABITypeAlignment(ElTy);
@@ -2637,8 +2641,8 @@ void CWriter::generateHeader(Module &M) {
       if (I->isThreadLocal())
         Out << "__thread ";
 
-      Type *ElTy = I->getType()->getElementType();
-      unsigned Alignment = I->getBaseObject()->getAlignment();
+      Type *ElTy = I->getType()->getPointerElementType();
+      unsigned Alignment = I->getAliaseeObject()->getAlignment();
       bool IsOveraligned =
           Alignment && Alignment > TD->getABITypeAlignment(ElTy);
       if (IsOveraligned) {
@@ -3385,7 +3389,7 @@ void CWriter::declareOneGlobalVariable(GlobalVariable *I) {
   if (I->isThreadLocal())
     Out << "__thread ";
 
-  Type *ElTy = I->getType()->getElementType();
+  Type *ElTy = I->getType()->getPointerElementType();
   unsigned Alignment = I->getAlignment();
   bool IsOveraligned = Alignment && Alignment > TD->getABITypeAlignment(ElTy);
   if (IsOveraligned) {
@@ -3746,7 +3750,7 @@ void CWriter::printFunction(Function &F) {
   // If this is a struct return function, handle the result with magic.
   if (isStructReturn) {
     Type *StructTy =
-        cast<PointerType>(F.arg_begin()->getType())->getElementType();
+        cast<PointerType>(F.arg_begin()->getType())->getPointerElementType();
     Out << "  ";
     printTypeName(Out, StructTy, false)
         << " StructReturn;  /* Struct return temporary */\n";
@@ -3761,7 +3765,7 @@ void CWriter::printFunction(Function &F) {
   // print local variable information for the function
   for (inst_iterator I = inst_begin(&F), E = inst_end(&F); I != E; ++I) {
     if (AllocaInst *AI = isDirectAlloca(&*I)) {
-      unsigned Alignment = AI->getAlignment();
+      unsigned Alignment = AI->getAlign().value();
       bool IsOveraligned = Alignment && Alignment > TD->getABITypeAlignment(
                                                         AI->getAllocatedType());
       Out << "  ";
@@ -4833,7 +4837,7 @@ void CWriter::visitCallInst(CallInst &I) {
   Value *Callee = I.getCalledOperand();
 
   PointerType *PTy = cast<PointerType>(Callee->getType());
-  FunctionType *FTy = cast<FunctionType>(PTy->getElementType());
+  FunctionType *FTy = cast<FunctionType>(PTy->getPointerElementType());
 
   // If this is a call to a struct-return function, assign to the first
   // parameter instead of passing it to the call.
@@ -4920,11 +4924,11 @@ void CWriter::visitCallInst(CallInst &I) {
       Out << '(';
       printTypeNameUnaligned(
           Out, FTy->getParamType(ArgNo),
-          /*isSigned=*/PAL.hasAttribute(ArgNo + 1, Attribute::SExt));
+          /*isSigned=*/PAL.hasAttributeAtIndex(ArgNo + 1, Attribute::SExt));
       Out << ')';
     }
     // Check if the argument is expected to be passed by value.
-    if (I.getAttributes().hasAttribute(ArgNo + 1, Attribute::ByVal))
+    if (I.getAttributes().hasAttributeAtIndex(ArgNo + 1, Attribute::ByVal))
       writeOperandDeref(*AI);
     else
       writeOperand(*AI, ContextCasted);
@@ -5331,7 +5335,7 @@ void CWriter::visitAllocaInst(AllocaInst &I) {
   Out << '(';
   printTypeName(Out, I.getType());
   Out << ") alloca(sizeof(";
-  printTypeName(Out, I.getType()->getElementType());
+  printTypeName(Out, I.getType()->getPointerElementType());
   if (I.isArrayAllocation()) {
     Out << ") * (";
     writeOperand(I.getArraySize(), ContextCasted);
@@ -5492,14 +5496,14 @@ void CWriter::visitLoadInst(LoadInst &I) {
   CurInstr = &I;
 
   writeMemoryAccess(I.getOperand(0), I.getType(), I.isVolatile(),
-                    I.getAlignment());
+                    I.getAlign().value());
 }
 
 void CWriter::visitStoreInst(StoreInst &I) {
   CurInstr = &I;
 
   writeMemoryAccess(I.getPointerOperand(), I.getOperand(0)->getType(),
-                    I.isVolatile(), I.getAlignment());
+                    I.isVolatile(), I.getAlign().value());
   Out << " = ";
   Value *Operand = I.getOperand(0);
   unsigned BitMask = 0;
@@ -5700,7 +5704,7 @@ void CWriter::visitExtractValueInst(ExtractValueInst &EVI) {
   Out << ")";
 }
 
-LLVM_ATTRIBUTE_NORETURN void CWriter::errorWithMessage(const char *message) {
+[[ noreturn ]] void CWriter::errorWithMessage(const char *message) {
 #ifndef NDEBUG
   errs() << message;
   errs() << " in: ";
